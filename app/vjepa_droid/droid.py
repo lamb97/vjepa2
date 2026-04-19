@@ -115,6 +115,8 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.h5_name = "trajectory.h5"
 
         samples = list(pd.read_csv(data_path, header=None, delimiter=" ").values[:, 0])
+        # Hold out the first few trajectories from training for quick manual validation.
+        samples = samples[4:]
         self.samples = samples
 
     def __getitem__(self, index):
