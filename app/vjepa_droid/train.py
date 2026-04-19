@@ -28,6 +28,11 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from app.vjepa_droid.droid import init_data
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
@@ -175,6 +180,23 @@ def main(args, resume_preempt=False):
     resume_path = os.path.join(folder, r_file) if r_file is not None else latest_path
     if not os.path.exists(resume_path):
         resume_path = None
+
+    wandb_run = None
+    use_wandb = cfgs_meta.get("use_wandb", False)
+    if rank == 0 and use_wandb:
+        if wandb is None:
+            logger.warning("W&B requested via meta.use_wandb=true, but wandb is not installed.")
+        else:
+            wandb_run = wandb.init(
+                project=cfgs_meta.get("wandb_project", "vjepa2"),
+                entity=cfgs_meta.get("wandb_entity"),
+                name=cfgs_meta.get("wandb_name"),
+                tags=cfgs_meta.get("wandb_tags"),
+                mode=cfgs_meta.get("wandb_mode", "online"),
+                dir=folder,
+                config=args,
+            )
+            wandb.save(os.path.join(folder, "params-pretrain.yaml"), base_path=folder)
 
     # -- make csv_logger
     csv_logger = CSVLogger(
@@ -462,9 +484,9 @@ def main(args, resume_preempt=False):
                 optimizer.zero_grad()
 
                 return (
-                    float(loss),
-                    float(jloss),
-                    float(sloss),
+                    float(loss.detach()),
+                    float(jloss.detach()),
+                    float(sloss.detach()),
                     _new_lr,
                     _new_wd,
                 )
@@ -487,6 +509,30 @@ def main(args, resume_preempt=False):
             # -- Logging
             def log_stats():
                 csv_logger.log(epoch + 1, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
+                if wandb_run is not None:
+                    wandb.log(
+                        {
+                            "epoch": epoch + 1,
+                            "iter": itr,
+                            "global_step": epoch * ipe + itr,
+                            "loss": loss,
+                            "loss_avg": loss_meter.avg,
+                            "jloss": jloss,
+                            "jloss_avg": jloss_meter.avg,
+                            "sloss": sloss,
+                            "sloss_avg": sloss_meter.avg,
+                            "lr": _new_lr,
+                            "wd": _new_wd,
+                            "iter_time_ms": iter_elapsed_time_ms,
+                            "gpu_time_ms": gpu_etime_ms,
+                            "data_time_ms": data_elapsed_time_ms,
+                            "iter_time_ms_avg": iter_time_meter.avg,
+                            "gpu_time_ms_avg": gpu_time_meter.avg,
+                            "data_time_ms_avg": data_elapsed_time_meter.avg,
+                            "max_memory_allocated_mb": torch.cuda.max_memory_allocated() / 1024.0**2,
+                        },
+                        step=epoch * ipe + itr,
+                    )
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
                         "[%d, %5d] loss: %.3f [%.2f, %.2f] "
@@ -515,6 +561,13 @@ def main(args, resume_preempt=False):
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
+        if wandb_run is not None:
+            wandb_run.summary["final_epoch"] = epoch + 1
+            wandb_run.summary["final_loss_avg"] = loss_meter.avg
+            wandb_run.summary["final_jloss_avg"] = jloss_meter.avg
+            wandb_run.summary["final_sloss_avg"] = sloss_meter.avg
+            wandb_run.summary["final_lr"] = _new_lr
+            wandb_run.summary["final_wd"] = _new_wd
         # -- Save Last
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
@@ -522,3 +575,6 @@ def main(args, resume_preempt=False):
                 save_every_file = f"e{epoch}.pt"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
+
+    if wandb_run is not None:
+        wandb_run.finish()
