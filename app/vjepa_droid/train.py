@@ -115,6 +115,7 @@ def main(args, resume_preempt=False):
     batch_size = cfgs_data.get("batch_size")
     tubelet_size = cfgs_data.get("tubelet_size")
     fps = cfgs_data.get("fps")
+    action_from_state_rotation_mode = cfgs_data.get("action_from_state_rotation_mode", "euler")
     crop_size = cfgs_data.get("crop_size", 256)
     patch_size = cfgs_data.get("patch_size")
     pin_mem = cfgs_data.get("pin_mem", False)

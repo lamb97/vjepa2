@@ -39,6 +39,7 @@ def init_data(
     collator=None,
     transform=None,
     camera_frame=False,
+    action_from_state_rotation_mode="euler",
     tubelet_size=2,
 ):
     dataset = DROIDVideoDataset(
@@ -103,6 +104,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.fps = fps
         self.transform = transform
         self.camera_frame = camera_frame
+        self.action_from_state_rotation_mode = action_from_state_rotation_mode
         if VideoReader is None:
             raise ImportError('Unable to import "decord" which is required to read videos.')
 
@@ -147,6 +149,18 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         closedness = poses[:, -1:]
         closedness_delta = closedness[1:] - closedness[:-1]
         return np.concatenate([xyz_diff, angle_diff, closedness_delta], axis=1)
+
+    def rotvec_poses_to_diffs(self, poses):
+        xyz = poses[:, :3]
+        rotvecs = poses[:, 3:6]
+        matrices = [Rotation.from_rotvec(rotvec).as_matrix() for rotvec in rotvecs]
+        xyz_diff = xyz[1:] - xyz[:-1]
+        angle_diff = [matrices[t].T @ matrices[t + 1] for t in range(len(matrices) - 1)]
+        angle_diff = [Rotation.from_matrix(mat).as_rotvec() for mat in angle_diff]
+        angle_diff = np.stack(angle_diff, axis=0)
+        gripper = poses[:, -1:]
+        gripper_term = gripper[1:] - gripper[:-1]
+        return np.concatenate([xyz_diff, angle_diff, gripper_term], axis=1)
 
     def transform_frame(self, poses, extrinsics):
         gripper = poses[:, -1:]
@@ -221,7 +235,10 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         extrinsics = extrinsics[indices, :][:: self.frameskip]
         if self.camera_frame:
             states = self.transform_frame(states, extrinsics)
-        actions = self.poses_to_diffs(states)
+        if self.action_from_state_rotation_mode == "rotvec":
+            actions = self.rotvec_poses_to_diffs(states)
+        else:
+            actions = self.poses_to_diffs(states)
         # --
         vr.seek(0)  # go to start of video before sampling frames
         buffer = vr.get_batch(indices).asnumpy()
