@@ -1,0 +1,27 @@
+planner:
+  history_len: 8
+  single_frame_input: False
+  rollout: 3
+  topk: 30
+  num_samples: 60
+  cem_steps: 10
+  maxnorm: 1
+  close_gripper_after: -1
+
+robot:
+  pyro_uri: PYRONAME:vjepa2_deploy
+  motion_command: moveL
+  state_rotation_mode: rotvec
+  action_rotation_mode: rotvec
+  use_gripper: false
+  gripper_state_scale: 255.0
+  gripper_action_mode: delta
+  gripper_action_scale: 255.0
+
+runtime:
+  device: cuda:1
+  execute_steps: 1
+  max_replans: 1
+  save_dir: deploy_outputs
+  checkpoint: /home/yang/4.8.vitg16-256px-8f/e200.pt
+  goal_image_path: /home/yang/SPARK-Remote/TeleopSoftware/data_collection/goal1.png
