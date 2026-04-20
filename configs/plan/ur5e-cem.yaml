@@ -1,0 +1,14 @@
+planner:
+  # checkpoint: /projects/standard/kdesingh/shared/liu03222/ur5e/0419_01/4.8.vitg16-256px-8f/latest.pt
+  split: val
+  start_frame: 0
+  goal_step: 2
+  plan_horizon: 1
+  samples: 800
+  topk: 30
+  cem_steps: 10
+  max_xyz: 1
+  max_rot: 1
+  max_gripper: 1
+  momentum_mean: 1
+  momentum_std: 1
