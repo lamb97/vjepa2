@@ -238,7 +238,7 @@ def encode_clip(encoder, clip, frames_per_clip, normalize_reps, dtype, mixed_pre
     with torch.autocast(**autocast_kwargs(clip.device, dtype, mixed_precision)):
         c = clip.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
         h = encoder(c)
-        h = h.view(1, frames_per_clip, -1, h.size(-1))
+        h = h.view(clip.size(0), frames_per_clip, -1, h.size(-1)).flatten(1, 2)
         if normalize_reps:
             h = F.layer_norm(h, (h.size(-1),))
         return h
@@ -263,11 +263,10 @@ def rollout_world_model(
     with torch.autocast(**autocast_kwargs(reps.device, dtype, mixed_precision)):
         for step in range(action_traj.size(1)):
             cur_actions = action_traj[:, : step + 1]
-            pred = predictor(reps.flatten(1, 2), cur_actions, states, extrinsics)
+            pred = predictor(reps, cur_actions, states, extrinsics)
             next_rep = pred[:, -tokens_per_frame:]
             if normalize_reps:
                 next_rep = F.layer_norm(next_rep, (next_rep.size(-1),))
-            next_rep = next_rep.view(pred.size(0), 1, tokens_per_frame, pred.size(-1))
             next_state = apply_action_to_state(states[:, -1:], cur_actions[:, -1:], rotation_mode)
             next_extr = extrinsics[:, -1:].clone()
             reps = torch.cat([reps, next_rep], dim=1)
@@ -300,10 +299,10 @@ def cem_plan(
     cem_verbose,
 ):
     device = context_rep.device
-    context_rep = context_rep.repeat(samples, 1, 1, 1)
+    context_rep = context_rep.repeat(samples, 1, 1)
     context_state = context_state.repeat(samples, 1, 1)
     context_extr = context_extr.repeat(samples, 1, 1)
-    goal_rep = goal_rep.repeat(samples, 1, 1, 1)
+    goal_rep = goal_rep.repeat(samples, 1, 1)
     topk = min(topk, samples)
 
     mean = torch.zeros(plan_horizon, 7, device=device, dtype=torch.float32)
@@ -320,9 +319,9 @@ def cem_plan(
         actions[..., 6:] = torch.clamp(actions[..., 6:], -max_gripper, max_gripper)
         return actions
 
-    for _ in range(cem_steps):
+    for step_idx in range(cem_steps):
         action_traj = sample_actions()
-        pred_reps, _ = rollout_world_model(
+        pred_reps, pred_states = rollout_world_model(
             predictor,
             context_rep,
             context_state,
@@ -334,14 +333,14 @@ def cem_plan(
             dtype,
             mixed_precision,
         )
-        final_rep = pred_reps[:, -1]
-        scores = torch.mean(torch.abs(final_rep.flatten(1) - goal_rep[:, -1].flatten(1)), dim=1)
+        final_rep = pred_reps[:, -tokens_per_frame:]
+        scores = torch.mean(torch.abs(final_rep.flatten(1) - goal_rep.flatten(1)), dim=1)
         top_idx = torch.topk(scores, k=topk, largest=False).indices
         selected = action_traj[top_idx]
         selected_scores = scores[top_idx]
         if cem_verbose:
             print(
-                f"[CEM] iter={_ + 1}/{cem_steps} "
+                f"[CEM] iter={step_idx + 1}/{cem_steps} "
                 f"best={scores.min().item():.6f} "
                 f"topk_mean={selected_scores.mean().item():.6f} "
                 f"topk_std={selected_scores.std().item():.6f}"
@@ -404,7 +403,7 @@ def main():
     extrinsics = torch.from_numpy(extrinsics).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
 
     encoder, predictor, epoch = load_models(cfg, checkpoint_path, device)
-    tokens_per_frame = int((data_cfg["crop_size"] // data_cfg["patch_size"]) ** 2)
+    frames_per_clip = clip.size(2)
     normalize_reps = loss_cfg.get("normalize_reps", True)
     rotation_mode = data_cfg.get("action_from_state_rotation_mode", "euler")
 
@@ -417,10 +416,17 @@ def main():
             dtype=dtype,
             mixed_precision=mixed_precision,
         )
-        context_rep = encoded[:, :1]
+        tokens_per_frame = encoded.size(1) // frames_per_clip
+        if encoded.size(1) % frames_per_clip != 0:
+            raise ValueError(
+                f"Encoded token count {encoded.size(1)} is not divisible by frames_per_clip={frames_per_clip}"
+            )
+        context_rep = encoded[:, :tokens_per_frame]
         context_state = states[:, :1]
         context_extr = extrinsics[:, :1]
-        goal_rep = encoded[:, goal_step : goal_step + 1]
+        goal_start = goal_step * tokens_per_frame
+        goal_end = (goal_step + 1) * tokens_per_frame
+        goal_rep = encoded[:, goal_start:goal_end]
 
         planned_actions = cem_plan(
             predictor=predictor,
@@ -457,7 +463,7 @@ def main():
             dtype,
             mixed_precision,
         )
-        pred_goal_l1 = torch.mean(torch.abs(pred_reps[:, -1].flatten(1) - goal_rep[:, -1].flatten(1)), dim=1)
+        pred_goal_l1 = torch.mean(torch.abs(pred_reps[:, -tokens_per_frame:].flatten(1) - goal_rep.flatten(1)), dim=1)
 
         gt_actions = actions[:, : args.plan_horizon]
         gt_reps, gt_states = rollout_world_model(
@@ -472,7 +478,7 @@ def main():
             dtype,
             mixed_precision,
         )
-        gt_goal_l1 = torch.mean(torch.abs(gt_reps[:, -1].flatten(1) - goal_rep[:, -1].flatten(1)), dim=1)
+        gt_goal_l1 = torch.mean(torch.abs(gt_reps[:, -tokens_per_frame:].flatten(1) - goal_rep.flatten(1)), dim=1)
 
     result = {
         "checkpoint": checkpoint_path,
