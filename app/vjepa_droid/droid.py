@@ -40,6 +40,10 @@ def init_data(
     transform=None,
     camera_frame=False,
     action_from_state_rotation_mode="euler",
+    enumerate_clips=False,
+    clip_stride_frames=1,
+    split="train",
+    holdout_trajectories=4,
     tubelet_size=2,
 ):
     dataset = DROIDVideoDataset(
@@ -50,6 +54,11 @@ def init_data(
         camera_views=camera_views,
         frameskip=tubelet_size,
         camera_frame=camera_frame,
+        action_from_state_rotation_mode=action_from_state_rotation_mode,
+        enumerate_clips=enumerate_clips,
+        clip_stride_frames=clip_stride_frames,
+        split=split,
+        holdout_trajectories=holdout_trajectories,
     )
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -97,6 +106,11 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         fps=5,
         transform=None,
         camera_frame=False,
+        action_from_state_rotation_mode="euler",
+        enumerate_clips=False,
+        clip_stride_frames=1,
+        split="train",
+        holdout_trajectories=4,
     ):
         self.data_path = data_path
         self.frames_per_clip = frames_per_clip
@@ -105,6 +119,10 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.camera_frame = camera_frame
         self.action_from_state_rotation_mode = action_from_state_rotation_mode
+        self.enumerate_clips = enumerate_clips
+        self.clip_stride_frames = max(int(clip_stride_frames), 1)
+        self.split = split
+        self.holdout_trajectories = max(int(holdout_trajectories), 0)
         if VideoReader is None:
             raise ImportError('Unable to import "decord" which is required to read videos.')
 
@@ -117,26 +135,67 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.h5_name = "trajectory.h5"
 
         samples = list(pd.read_csv(data_path, header=None, delimiter=" ").values[:, 0])
-        # Hold out the first few trajectories from training for quick manual validation.
-        samples = samples[4:]
+        if self.holdout_trajectories > 0:
+            if self.split == "train":
+                samples = samples[self.holdout_trajectories :]
+            elif self.split == "val":
+                samples = samples[: self.holdout_trajectories]
+            else:
+                raise ValueError(f"Unsupported split={self.split}")
         self.samples = samples
+        self.clip_index = None
+        if self.enumerate_clips:
+            self.clip_index = self._build_clip_index()
 
     def __getitem__(self, index):
-        path = self.samples[index]
+        if self.clip_index is None:
+            path = self.samples[index]
+            start_frame = None
+        else:
+            path, start_frame = self.clip_index[index]
 
         # -- keep trying to load videos until you find a valid sample
         loaded_video = False
         while not loaded_video:
             try:
-                buffer, actions, states, extrinsics, indices = self.loadvideo_decord(path)
+                buffer, actions, states, extrinsics, indices = self.loadvideo_decord(path, start_frame=start_frame)
                 loaded_video = True
             except Exception as e:
                 logger.info(f"Encountered exception when loading video {path=} {e=}")
                 loaded_video = False
                 index = np.random.randint(self.__len__())
-                path = self.samples[index]
+                if self.clip_index is None:
+                    path = self.samples[index]
+                    start_frame = None
+                else:
+                    path, start_frame = self.clip_index[index]
 
         return buffer, actions, states, extrinsics, indices
+
+    def _build_clip_index(self):
+        clip_index = []
+        for path in self.samples:
+            metadata = get_json(path)
+            if metadata is None:
+                logger.warning(f"Missing metadata while indexing clips for {path}")
+                continue
+            camera_key = self.camera_views[0]
+            mp4_name = metadata[camera_key].split("recordings/MP4/")[-1]
+            vpath = os.path.join(path, "recordings/MP4", mp4_name)
+            vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
+            vfps = vr.get_avg_fps()
+            fps = self.fps if self.fps is not None else vfps
+            fstp = ceil(vfps / fps)
+            nframes = int(self.frames_per_clip * fstp)
+            vlen = len(vr)
+            if vlen < nframes:
+                logger.warning(f"Skipping short trajectory during clip indexing: {vpath}, {vlen=} < {nframes=}")
+                continue
+            max_start = vlen - nframes
+            starts = range(0, max_start + 1, self.clip_stride_frames)
+            clip_index.extend((path, sf) for sf in starts)
+        logger.info(f"Enumerated {len(clip_index)} clips from {len(self.samples)} trajectories")
+        return clip_index
 
     def poses_to_diffs(self, poses):
         xyz = poses[:, :3]  # shape [T, 3]
@@ -191,7 +250,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
 
         return np.concatenate([new_pose, gripper], axis=1)
 
-    def loadvideo_decord(self, path):
+    def loadvideo_decord(self, path, start_frame=None):
         # -- load metadata
         metadata = get_json(path)
         if metadata is None:
@@ -227,8 +286,13 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
             raise Exception(f"Video is too short {vpath=}, {nframes=}, {vlen=}")
 
         # sample a random window of nframes
-        ef = np.random.randint(nframes, vlen)
-        sf = ef - nframes
+        if start_frame is None:
+            ef = np.random.randint(nframes, vlen)
+            sf = ef - nframes
+        else:
+            sf = int(start_frame)
+            if sf < 0 or sf + nframes > vlen:
+                raise Exception(f"Invalid clip start {sf} for {vpath=}, {nframes=}, {vlen=}")
         indices = np.arange(sf, sf + nframes, fstp).astype(np.int64)
         # --
         states = states[indices, :][:: self.frameskip]
@@ -248,4 +312,4 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         return buffer, actions, states, extrinsics, indices
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) if self.clip_index is None else len(self.clip_index)

@@ -15,6 +15,9 @@ data:
     - /projects/standard/kdesingh/shared/liu03222/ur5_vjepa_0409/train_paths.csv
   dataset_fpcs:
   - 8
+  holdout_trajectories: 4
+  enumerate_clips: true
+  clip_stride_frames: 30
   fps: 4
   num_workers: 12
   action_from_state_rotation_mode: rotvec

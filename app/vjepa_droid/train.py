@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 try:
@@ -116,6 +117,9 @@ def main(args, resume_preempt=False):
     tubelet_size = cfgs_data.get("tubelet_size")
     fps = cfgs_data.get("fps")
     action_from_state_rotation_mode = cfgs_data.get("action_from_state_rotation_mode", "euler")
+    enumerate_clips = cfgs_data.get("enumerate_clips", False)
+    clip_stride_frames = cfgs_data.get("clip_stride_frames", 1)
+    holdout_trajectories = cfgs_data.get("holdout_trajectories", 4)
     crop_size = cfgs_data.get("crop_size", 256)
     patch_size = cfgs_data.get("patch_size")
     pin_mem = cfgs_data.get("pin_mem", False)
@@ -212,6 +216,8 @@ def main(args, resume_preempt=False):
     )
 
     # -- init model
+    model_max_num_frames = max_num_frames * tubelet_size
+
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
         device=device,
@@ -262,6 +268,11 @@ def main(args, resume_preempt=False):
         fps=fps,
         camera_views=camera_views,
         camera_frame=camera_frame,
+        action_from_state_rotation_mode=action_from_state_rotation_mode,
+        enumerate_clips=enumerate_clips,
+        clip_stride_frames=clip_stride_frames,
+        split="train",
+        holdout_trajectories=holdout_trajectories,
         stereo_view=stereo_view,
         transform=transform,
         collator=video_collator,
@@ -271,10 +282,42 @@ def main(args, resume_preempt=False):
         persistent_workers=persistent_workers,
         rank=rank,
     )
+    val_loader = None
+    val_sampler = None
+    if holdout_trajectories > 0:
+        try:
+            val_loader, val_sampler = init_data(
+                data_path=dataset_path,
+                batch_size=batch_size,
+                frames_per_clip=max_num_frames,
+                tubelet_size=1,
+                fps=fps,
+                camera_views=camera_views,
+                camera_frame=camera_frame,
+                action_from_state_rotation_mode=action_from_state_rotation_mode,
+                enumerate_clips=enumerate_clips,
+                clip_stride_frames=clip_stride_frames,
+                split="val",
+                holdout_trajectories=holdout_trajectories,
+                stereo_view=stereo_view,
+                transform=transform,
+                collator=video_collator,
+                num_workers=num_workers,
+                world_size=world_size,
+                pin_mem=pin_mem,
+                persistent_workers=persistent_workers,
+                rank=rank,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize validation loader: {e}")
+            val_loader = None
+            val_sampler = None
     _dlen = len(unsupervised_loader)
     if ipe is None:
         ipe = _dlen
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
+    if val_loader is not None:
+        logger.info(f"validation iterations per epoch/dataset length: {len(val_loader)}")
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
@@ -354,6 +397,86 @@ def main(args, resume_preempt=False):
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
+    def reduce_average_scalar(value):
+        if dist.is_available() and dist.is_initialized():
+            tensor = torch.tensor(value, device=device, dtype=torch.float64)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            tensor /= dist.get_world_size()
+            return float(tensor.item())
+        return float(value)
+
+    def forward_target(c):
+        with torch.no_grad():
+            c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+            h = target_encoder(c)
+            h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
+            if normalize_reps:
+                h = F.layer_norm(h, (h.size(-1),))
+            return h
+
+    def forward_predictions(z, actions, states, extrinsics):
+        def _step_predictor(_z, _a, _s, _e):
+            _z = predictor(_z, _a, _s, _e)
+            if normalize_reps:
+                _z = F.layer_norm(_z, (_z.size(-1),))
+            return _z
+
+        _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1]
+        z_tf = _step_predictor(_z, _a, _s, _e)
+
+        _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
+        for n in range(1, auto_steps):
+            _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], extrinsics[:, : n + 1]
+            _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
+            _z = torch.cat([_z, _z_nxt], dim=1)
+        z_ar = _z[:, tokens_per_frame:]
+
+        return z_tf, z_ar
+
+    def loss_fn(z, h):
+        _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
+        return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
+
+    def evaluate(epoch):
+        if val_loader is None:
+            return None
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
+
+        val_loss_meter = AverageMeter()
+        val_jloss_meter = AverageMeter()
+        val_sloss_meter = AverageMeter()
+
+        encoder.eval()
+        predictor.eval()
+        target_encoder.eval()
+        with torch.no_grad():
+            for sample in val_loader:
+                clips = sample[0].to(device, non_blocking=True)
+                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)
+                states = sample[2].to(device, dtype=torch.float, non_blocking=True)
+                extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)
+
+                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                    h = forward_target(clips)
+                    z_tf, z_ar = forward_predictions(h, actions, states, extrinsics)
+                    jloss = loss_fn(z_tf, h)
+                    sloss = loss_fn(z_ar, h)
+                    loss = jloss + sloss
+
+                val_loss_meter.update(float(loss.detach()))
+                val_jloss_meter.update(float(jloss.detach()))
+                val_sloss_meter.update(float(sloss.detach()))
+        encoder.train()
+        predictor.train()
+        target_encoder.train()
+
+        return {
+            "loss": reduce_average_scalar(val_loss_meter.avg),
+            "jloss": reduce_average_scalar(val_jloss_meter.avg),
+            "sloss": reduce_average_scalar(val_sloss_meter.avg),
+        }
+
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
     loader = iter(unsupervised_loader)
@@ -428,45 +551,10 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
                 # --
 
-                def forward_target(c):
-                    with torch.no_grad():
-                        c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
-                        h = target_encoder(c)
-                        h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
-                        if normalize_reps:
-                            h = F.layer_norm(h, (h.size(-1),))
-                        return h
-
-                def forward_predictions(z):
-
-                    def _step_predictor(_z, _a, _s, _e):
-                        _z = predictor(_z, _a, _s, _e)
-                        if normalize_reps:
-                            _z = F.layer_norm(_z, (_z.size(-1),))
-                        return _z
-
-                    # -- one step of predictor with teacher forcing
-                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1]
-                    z_tf = _step_predictor(_z, _a, _s, _e)
-
-                    # -- full auto-regressive rollouts of predictor
-                    _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
-                    for n in range(1, auto_steps):
-                        _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], extrinsics[:, : n + 1]
-                        _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
-                        _z = torch.cat([_z, _z_nxt], dim=1)
-                    z_ar = _z[:, tokens_per_frame:]
-
-                    return z_tf, z_ar
-
-                def loss_fn(z, h):
-                    _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
-                    return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
-
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
-                    z_tf, z_ar = forward_predictions(h)
+                    z_tf, z_ar = forward_predictions(h, actions, states, extrinsics)
                     jloss = loss_fn(z_tf, h)
                     sloss = loss_fn(z_ar, h)
                     loss = jloss + sloss
@@ -562,6 +650,22 @@ def main(args, resume_preempt=False):
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
+        val_metrics = evaluate(epoch)
+        if val_metrics is not None:
+            logger.info(
+                "val loss %.3f [%.3f, %.3f]"
+                % (val_metrics["loss"], val_metrics["jloss"], val_metrics["sloss"])
+            )
+            if wandb_run is not None and rank == 0:
+                wandb.log(
+                    {
+                        "epoch": epoch + 1,
+                        "val/loss": val_metrics["loss"],
+                        "val/jloss": val_metrics["jloss"],
+                        "val/sloss": val_metrics["sloss"],
+                    },
+                    step=(epoch + 1) * ipe,
+                )
         if wandb_run is not None:
             wandb_run.summary["final_epoch"] = epoch + 1
             wandb_run.summary["final_loss_avg"] = loss_meter.avg
