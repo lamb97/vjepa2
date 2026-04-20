@@ -30,10 +30,10 @@ data_aug:
   horizontal_flip: false
   motion_shift: false
   random_resize_aspect_ratio:
-  - 0.75
-  - 1.35
+  - 1.0
+  - 1.0
   random_resize_scale:
-  - 1.777
+  - 1.0
   - 1.777
   reprob: 0.0
 loss:
