@@ -1,6 +1,6 @@
 app: vjepa_droid
 cpus_per_task: 12
-folder: /projects/standard/kdesingh/shared/liu03222/ur5e/0421_01/4.8.vitg16-256px-8f
+folder: /projects/standard/kdesingh/shared/liu03222/real_cartesian_224/4.20.vitg16-224px-8f
 mem_per_gpu: 220G
 nodes: 1
 tasks_per_node: 4
@@ -8,19 +8,14 @@ data:
   batch_size: 8
   camera_views:
   - left_mp4_path
-  crop_size: 256
+  crop_size: 224
   datasets:
-    # CSV file, each line is a trajectory dir path
-    # See https://github.com/facebookresearch/vjepa2/issues/65
-    - /projects/standard/kdesingh/shared/liu03222/ur5_vjepa_0409_action/train_paths.csv
-    - /projects/standard/kdesingh/shared/liu03222/ur5_vjepa_0421/train_paths.csv
+    - /scratch.global/liu03222/datasets/real_data_cartesian_224_vjepa/train_paths.csv
   dataset_fpcs:
   - 8
-  - 8
-  holdout_trajectories: 0
-  val_clip_ratio: 0.1
+  holdout_trajectories: 30
   enumerate_clips: true
-  clip_stride_frames: 33
+  clip_stride_frames: 20
   fps: 4
   num_workers: 12
   action_from_state_rotation_mode: rotvec
@@ -52,14 +47,13 @@ meta:
   pretrain_checkpoint: /projects/standard/kdesingh/shared/liu03222/vjepa2_checkpoints/vitg.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
-  save_every_freq: 30
+  save_every_freq: 10
   seed: 239
   use_sdpa: true
   use_wandb: true
   wandb_project: vjepa2
-  # wandb_entity: your_entity   # 可选
-  wandb_name: ur5e-256px-8f   # 可选
-  wandb_mode: online          # 可选，可改成 offline
+  wandb_name: real-cartesian-224-8f
+  wandb_mode: online
 model:
   model_name: vit_giant_xformers
   pred_depth: 24

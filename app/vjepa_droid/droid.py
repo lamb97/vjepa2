@@ -44,7 +44,9 @@ def init_data(
     clip_stride_frames=1,
     split="train",
     holdout_trajectories=4,
+    val_clip_ratio=None,
     tubelet_size=2,
+    split_seed=0,
 ):
     dataset = DROIDVideoDataset(
         data_path=data_path,
@@ -59,6 +61,8 @@ def init_data(
         clip_stride_frames=clip_stride_frames,
         split=split,
         holdout_trajectories=holdout_trajectories,
+        val_clip_ratio=val_clip_ratio,
+        split_seed=split_seed,
     )
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -111,6 +115,8 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         clip_stride_frames=1,
         split="train",
         holdout_trajectories=4,
+        val_clip_ratio=None,
+        split_seed=0,
     ):
         self.data_path = data_path
         self.frames_per_clip = frames_per_clip
@@ -123,6 +129,8 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.clip_stride_frames = max(int(clip_stride_frames), 1)
         self.split = split
         self.holdout_trajectories = max(int(holdout_trajectories), 0)
+        self.val_clip_ratio = None if val_clip_ratio is None else float(val_clip_ratio)
+        self.split_seed = int(split_seed)
         if VideoReader is None:
             raise ImportError('Unable to import "decord" which is required to read videos.')
 
@@ -134,8 +142,14 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.camera_views = camera_views
         self.h5_name = "trajectory.h5"
 
-        samples = list(pd.read_csv(data_path, header=None, delimiter=" ").values[:, 0])
-        if self.holdout_trajectories > 0:
+        data_paths = [data_path] if isinstance(data_path, str) else list(data_path)
+        samples = []
+        for path in data_paths:
+            samples.extend(list(pd.read_csv(path, header=None, delimiter=" ").values[:, 0]))
+        if self.val_clip_ratio is None and self.holdout_trajectories > 0:
+            rng = np.random.default_rng(self.split_seed)
+            permuted_indices = rng.permutation(len(samples))
+            samples = [samples[idx] for idx in permuted_indices]
             if self.split == "train":
                 samples = samples[self.holdout_trajectories :]
             elif self.split == "val":
@@ -146,6 +160,25 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.clip_index = None
         if self.enumerate_clips:
             self.clip_index = self._build_clip_index()
+            if self.val_clip_ratio is not None:
+                if not 0.0 < self.val_clip_ratio < 1.0:
+                    raise ValueError(f"val_clip_ratio must be in (0, 1), got {self.val_clip_ratio}")
+                rng = np.random.default_rng(self.split_seed)
+                permuted_indices = rng.permutation(len(self.clip_index))
+                val_count = max(1, int(round(len(self.clip_index) * self.val_clip_ratio)))
+                if self.split == "train":
+                    chosen_indices = permuted_indices[val_count:]
+                elif self.split == "val":
+                    chosen_indices = permuted_indices[:val_count]
+                else:
+                    raise ValueError(f"Unsupported split={self.split}")
+                self.clip_index = [self.clip_index[idx] for idx in chosen_indices]
+                logger.info(
+                    "Clip-level split produced %d %s clips from %d total clips",
+                    len(self.clip_index),
+                    self.split,
+                    len(permuted_indices),
+                )
 
     def __getitem__(self, index):
         if self.clip_index is None:

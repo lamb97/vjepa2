@@ -1,14 +1,15 @@
 planner:
   # checkpoint: /projects/standard/kdesingh/shared/liu03222/ur5e/0419_01/4.8.vitg16-256px-8f/latest.pt
-  split: val
+  # checkpoint: /projects/standard/kdesingh/shared/liu03222/ur5e/0421_01/4.8.vjepa2-ac-vitg-256px-8f/latest.pt
+  split: train
   start_frame: 0
-  goal_step: 2
-  plan_horizon: 1
-  samples: 800
-  topk: 30
+  goal_step: 5
+  plan_horizon: 5
+  samples: 400
+  topk: 10
   cem_steps: 10
-  max_xyz: 1
-  max_rot: 1
-  max_gripper: 1
-  momentum_mean: 1
-  momentum_std: 1
+  maxnorm: 0.075
+  momentum_mean: 0.15
+  momentum_std: 0.75
+  momentum_mean_gripper: 0.15
+  momentum_std_gripper: 0.15

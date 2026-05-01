@@ -107,7 +107,7 @@ def main(args, resume_preempt=False):
     # -- DATA
     cfgs_data = args.get("data")
     datasets = cfgs_data.get("datasets", [])
-    dataset_path = datasets[0]
+    dataset_paths = datasets
     dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
     camera_frame = cfgs_data.get("camera_frame", False)
@@ -120,6 +120,7 @@ def main(args, resume_preempt=False):
     enumerate_clips = cfgs_data.get("enumerate_clips", False)
     clip_stride_frames = cfgs_data.get("clip_stride_frames", 1)
     holdout_trajectories = cfgs_data.get("holdout_trajectories", 4)
+    val_clip_ratio = cfgs_data.get("val_clip_ratio")
     crop_size = cfgs_data.get("crop_size", 256)
     patch_size = cfgs_data.get("patch_size")
     pin_mem = cfgs_data.get("pin_mem", False)
@@ -261,7 +262,7 @@ def main(args, resume_preempt=False):
 
     # -- init data-loaders/samplers
     (unsupervised_loader, unsupervised_sampler) = init_data(
-        data_path=dataset_path,
+        data_path=dataset_paths,
         batch_size=batch_size,
         frames_per_clip=max_num_frames,
         tubelet_size=1,
@@ -273,6 +274,8 @@ def main(args, resume_preempt=False):
         clip_stride_frames=clip_stride_frames,
         split="train",
         holdout_trajectories=holdout_trajectories,
+        val_clip_ratio=val_clip_ratio,
+        split_seed=seed,
         stereo_view=stereo_view,
         transform=transform,
         collator=video_collator,
@@ -284,10 +287,10 @@ def main(args, resume_preempt=False):
     )
     val_loader = None
     val_sampler = None
-    if holdout_trajectories > 0:
+    if (val_clip_ratio is not None) or (holdout_trajectories > 0):
         try:
             val_loader, val_sampler = init_data(
-                data_path=dataset_path,
+                data_path=dataset_paths,
                 batch_size=batch_size,
                 frames_per_clip=max_num_frames,
                 tubelet_size=1,
@@ -299,6 +302,8 @@ def main(args, resume_preempt=False):
                 clip_stride_frames=clip_stride_frames,
                 split="val",
                 holdout_trajectories=holdout_trajectories,
+                val_clip_ratio=val_clip_ratio,
+                split_seed=seed,
                 stereo_view=stereo_view,
                 transform=transform,
                 collator=video_collator,

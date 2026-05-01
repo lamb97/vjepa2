@@ -1,0 +1,129 @@
+{
+  "checkpoint": "/projects/standard/kdesingh/shared/liu03222/ur5e/0421_01/4.8.vjepa2-ac-vitg-256px-8f/latest.pt",
+  "checkpoint_epoch": 261,
+  "goal_step": 7,
+  "splits": [
+    {
+      "split": "train",
+      "example_index": 2539,
+      "episode_path": "/projects/standard/kdesingh/shared/liu03222/ur5_vjepa_0421/traj_000205",
+      "raw_start_frame": 891,
+      "raw_goal_frame": 926,
+      "sampling_stride_frames": 5,
+      "clip_frame_indices": [
+        891,
+        896,
+        901,
+        906,
+        911,
+        916,
+        921,
+        926
+      ],
+      "goal_step": 7,
+      "rotation_mode": "rotvec",
+      "output_path": "one_step_energy_outputs/train_idx2539_start891_goal7.png",
+      "gt_one_step_action": [
+        -0.021454,
+        -0.051212,
+        -0.012729,
+        -0.00019,
+        -0.019343,
+        0.055478,
+        0.728889
+      ],
+      "gt_one_step_final_state": [
+        -0.682727,
+        0.422625,
+        -0.214278,
+        -1.194699,
+        -1.228169,
+        -1.398399,
+        0.826667
+      ],
+      "goal_state": [
+        -0.682727,
+        0.422625,
+        -0.214278,
+        -1.194699,
+        -1.228169,
+        -1.398399,
+        0.826667
+      ],
+      "gt_loss": 0.34625497460365295,
+      "best_grid_action": [
+        -0.075,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "best_grid_loss": 0.35448548197746277,
+      "energy_nsamples": 5,
+      "energy_grid_size": 0.075
+    },
+    {
+      "split": "val",
+      "example_index": 211,
+      "episode_path": "/projects/standard/kdesingh/shared/liu03222/ur5_vjepa_0421/traj_000188",
+      "raw_start_frame": 66,
+      "raw_goal_frame": 101,
+      "sampling_stride_frames": 5,
+      "clip_frame_indices": [
+        66,
+        71,
+        76,
+        81,
+        86,
+        91,
+        96,
+        101
+      ],
+      "goal_step": 7,
+      "rotation_mode": "rotvec",
+      "output_path": "one_step_energy_outputs/val_idx211_start66_goal7.png",
+      "gt_one_step_action": [
+        -0.008878,
+        -0.023142,
+        -0.007179,
+        0.00995,
+        -0.016525,
+        0.010502,
+        0.0
+      ],
+      "gt_one_step_final_state": [
+        -0.707669,
+        0.449524,
+        -0.261188,
+        -1.605782,
+        -0.824313,
+        -1.232752,
+        1.0
+      ],
+      "goal_state": [
+        -0.707669,
+        0.449524,
+        -0.261188,
+        -1.605782,
+        -0.824313,
+        -1.232752,
+        1.0
+      ],
+      "gt_loss": 0.3606876730918884,
+      "best_grid_action": [
+        -0.075,
+        0.0375,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "best_grid_loss": 0.3627738058567047,
+      "energy_nsamples": 5,
+      "energy_grid_size": 0.075
+    }
+  ]
+}

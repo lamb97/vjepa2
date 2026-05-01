@@ -30,11 +30,15 @@ def parse_args():
     parser.add_argument("--samples", type=int, default=256, help="CEM samples per iteration.")
     parser.add_argument("--topk", type=int, default=32, help="Top-k samples kept by CEM.")
     parser.add_argument("--cem-steps", type=int, default=8, help="Number of CEM refinement iterations.")
-    parser.add_argument("--max-xyz", type=float, default=0.05, help="Absolute clamp for xyz delta.")
-    parser.add_argument("--max-rot", type=float, default=0.15, help="Absolute clamp for rotation delta.")
-    parser.add_argument("--max-gripper", type=float, default=0.5, help="Absolute clamp for gripper delta.")
+    parser.add_argument("--maxnorm", type=float, default=0.075, help="Notebook-style raw xyz action clamp.")
     parser.add_argument("--momentum-mean", type=float, default=0.25)
     parser.add_argument("--momentum-std", type=float, default=0.75)
+    parser.add_argument("--momentum-mean-gripper", type=float, default=0.15)
+    parser.add_argument("--momentum-std-gripper", type=float, default=0.15)
+    parser.add_argument("--plot-energy-landscape", action="store_true", help="Save notebook-style xyz energy heatmap.")
+    parser.add_argument("--energy-nsamples", type=int, default=5, help="Grid samples per xyz axis.")
+    parser.add_argument("--energy-grid-size", type=float, default=0.075, help="Raw xyz grid range for energy plot.")
+    parser.add_argument("--energy-output", default=None, help="PNG path for the energy landscape plot.")
     parser.add_argument("--cem-verbose", action="store_true", help="Print per-iteration CEM losses.")
     return parser.parse_args()
 
@@ -89,7 +93,8 @@ def build_transform(cfg):
 
 def build_dataset(cfg, transform, split):
     data = cfg["data"]
-    dataset_path = data["datasets"][0]
+    meta = cfg["meta"]
+    dataset_path = data["datasets"]
     camera_views = data.get("camera_views", ["left_mp4_path"])
     return DROIDVideoDataset(
         data_path=dataset_path,
@@ -100,21 +105,29 @@ def build_dataset(cfg, transform, split):
         transform=transform,
         camera_frame=data.get("camera_frame", False),
         action_from_state_rotation_mode=data.get("action_from_state_rotation_mode", "euler"),
-        enumerate_clips=False,
+        enumerate_clips=data.get("enumerate_clips", False),
         clip_stride_frames=data.get("clip_stride_frames", 1),
         split=split,
         holdout_trajectories=data.get("holdout_trajectories", 4),
+        val_clip_ratio=data.get("val_clip_ratio"),
+        split_seed=meta.get("seed", 0),
     )
 
 
 def resolve_episode_path(args, dataset):
     if args.episode_path is not None:
-        return args.episode_path
+        return args.episode_path, args.start_frame
     if args.episode_index is None:
         raise ValueError("Provide either --episode-path or --episode-index.")
+    if dataset.clip_index is not None:
+        if args.episode_index < 0 or args.episode_index >= len(dataset.clip_index):
+            raise IndexError(
+                f"episode_index={args.episode_index} is out of range for split clip count {len(dataset.clip_index)}"
+            )
+        return dataset.clip_index[args.episode_index]
     if args.episode_index < 0 or args.episode_index >= len(dataset.samples):
         raise IndexError(f"episode_index={args.episode_index} is out of range for split size {len(dataset.samples)}")
-    return dataset.samples[args.episode_index]
+    return dataset.samples[args.episode_index], args.start_frame
 
 
 def load_planning_example(dataset, episode_path, start_frame, plan_horizon, goal_step):
@@ -228,6 +241,7 @@ def load_models(cfg, checkpoint_path, device):
         target_encoder=None,
         opt=None,
         scaler=None,
+        replace_kw=["module.", "backbone."],
     )
     encoder.eval()
     predictor.eval()
@@ -291,11 +305,11 @@ def cem_plan(
     samples,
     topk,
     cem_steps,
-    max_xyz,
-    max_rot,
-    max_gripper,
+    maxnorm,
     momentum_mean,
     momentum_std,
+    momentum_mean_gripper,
+    momentum_std_gripper,
     cem_verbose,
 ):
     device = context_rep.device
@@ -305,19 +319,35 @@ def cem_plan(
     goal_rep = goal_rep.repeat(samples, 1, 1)
     topk = min(topk, samples)
 
-    mean = torch.zeros(plan_horizon, 7, device=device, dtype=torch.float32)
-    std = torch.tensor(
-        [max_xyz, max_xyz, max_xyz, max_rot, max_rot, max_rot, max_gripper],
-        device=device,
-        dtype=torch.float32,
-    ).repeat(plan_horizon, 1)
+    mean = torch.cat(
+        [
+            torch.zeros((plan_horizon, 3), device=device, dtype=torch.float32),
+            torch.zeros((plan_horizon, 1), device=device, dtype=torch.float32),
+        ],
+        dim=-1,
+    )
+    std = torch.cat(
+        [
+            torch.ones((plan_horizon, 3), device=device, dtype=torch.float32) * maxnorm,
+            torch.ones((plan_horizon, 1), device=device, dtype=torch.float32),
+        ],
+        dim=-1,
+    )
 
     def sample_actions():
-        actions = torch.randn(samples, plan_horizon, 7, device=device, dtype=torch.float32) * std + mean
-        actions[..., :3] = torch.clamp(actions[..., :3], -max_xyz, max_xyz)
-        actions[..., 3:6] = torch.clamp(actions[..., 3:6], -max_rot, max_rot)
-        actions[..., 6:] = torch.clamp(actions[..., 6:], -max_gripper, max_gripper)
-        return actions
+        action_samples = (
+            torch.randn(samples, plan_horizon, 4, device=device, dtype=torch.float32) * std + mean
+        )
+        action_samples[..., :3] = torch.clip(action_samples[..., :3], min=-maxnorm, max=maxnorm)
+        action_samples[..., -1:] = torch.clip(action_samples[..., -1:], min=-0.75, max=0.75)
+        return torch.cat(
+            [
+                action_samples[..., :3],
+                torch.zeros((samples, plan_horizon, 3), device=device, dtype=torch.float32),
+                action_samples[..., -1:],
+            ],
+            dim=-1,
+        )
 
     for step_idx in range(cem_steps):
         action_traj = sample_actions()
@@ -345,10 +375,117 @@ def cem_plan(
                 f"topk_mean={selected_scores.mean().item():.6f} "
                 f"topk_std={selected_scores.std().item():.6f}"
             )
-        mean = selected.mean(dim=0) * (1.0 - momentum_mean) + mean * momentum_mean
-        std = selected.std(dim=0) * (1.0 - momentum_std) + std * momentum_std
+        selected_mean = selected.mean(dim=0)
+        selected_std = selected.std(dim=0)
+        mean = torch.cat(
+            [
+                selected_mean[..., :3] * (1.0 - momentum_mean) + mean[..., :3] * momentum_mean,
+                selected_mean[..., -1:] * (1.0 - momentum_mean_gripper)
+                + mean[..., -1:] * momentum_mean_gripper,
+            ],
+            dim=-1,
+        )
+        std = torch.cat(
+            [
+                selected_std[..., :3] * (1.0 - momentum_std) + std[..., :3] * momentum_std,
+                selected_std[..., -1:] * (1.0 - momentum_std_gripper) + std[..., -1:] * momentum_std_gripper,
+            ],
+            dim=-1,
+        )
 
-    return mean.unsqueeze(0)
+    gripper = mean[..., -1:].clone()
+    gripper[torch.abs(gripper) < 0.25] = 0.0
+    return torch.cat(
+        [
+            mean[..., :3],
+            torch.zeros((plan_horizon, 3), device=device, dtype=torch.float32),
+            gripper,
+        ],
+        dim=-1,
+    ).unsqueeze(0)
+
+
+def compute_energy_landscape(
+    predictor,
+    context_rep,
+    context_state,
+    context_extr,
+    goal_rep,
+    tokens_per_frame,
+    normalize_reps,
+    rotation_mode,
+    dtype,
+    mixed_precision,
+    nsamples,
+    grid_size,
+):
+    device = context_rep.device
+    action_samples = []
+    for dx in np.linspace(-grid_size, grid_size, nsamples):
+        for dy in np.linspace(-grid_size, grid_size, nsamples):
+            for dz in np.linspace(-grid_size, grid_size, nsamples):
+                action_samples.append([dx, dy, dz, 0.0, 0.0, 0.0, 0.0])
+    action_grid = torch.tensor(action_samples, device=device, dtype=torch.float32).unsqueeze(1)
+
+    pred_reps, pred_states = rollout_world_model(
+        predictor,
+        context_rep.repeat(action_grid.size(0), 1, 1),
+        context_state.repeat(action_grid.size(0), 1, 1),
+        context_extr.repeat(action_grid.size(0), 1, 1),
+        action_grid,
+        tokens_per_frame,
+        normalize_reps,
+        rotation_mode,
+        dtype,
+        mixed_precision,
+    )
+    losses = torch.mean(
+        torch.abs(pred_reps[:, -tokens_per_frame:].flatten(1) - goal_rep.repeat(action_grid.size(0), 1, 1).flatten(1)),
+        dim=1,
+    )
+    best_idx = torch.argmin(losses)
+    return action_grid[:, 0], losses, pred_states, best_idx
+
+
+def save_energy_landscape_plot(actions, losses, gt_actions, output_path, nsamples):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    actions_np = actions.detach().cpu().numpy()
+    losses_np = losses.detach().cpu().numpy()
+    gt_np = gt_actions.detach().cpu().numpy()
+
+    heatmap, xedges, zedges = np.histogram2d(
+        actions_np[:, 0],
+        actions_np[:, 2],
+        weights=losses_np,
+        bins=nsamples,
+    )
+    counts, _, _ = np.histogram2d(actions_np[:, 0], actions_np[:, 2], bins=[xedges, zedges])
+    heatmap = heatmap / np.maximum(counts, 1)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    image = ax.imshow(
+        heatmap.T,
+        origin="lower",
+        extent=[xedges[0], xedges[-1], zedges[0], zedges[-1]],
+        cmap="viridis",
+        aspect="auto",
+    )
+    ax.scatter([gt_np[0, 0, 0]], [gt_np[0, 0, 2]], c="red", marker="x", s=80, label="GT")
+    best_idx = int(np.argmin(losses_np))
+    ax.scatter([actions_np[best_idx, 0]], [actions_np[best_idx, 2]], c="white", marker="o", s=45, label="best grid")
+    ax.set_xlabel("Action Delta x")
+    ax.set_ylabel("Action Delta z")
+    ax.set_title("Energy Landscape")
+    ax.legend(loc="best")
+    fig.colorbar(image, ax=ax, label="latent L1")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
 
 
 def tensor_to_list(tensor):
@@ -379,14 +516,14 @@ def main():
 
     transform = build_transform(cfg)
     dataset = build_dataset(cfg, transform=transform, split=args.split)
-    episode_path = resolve_episode_path(args, dataset)
+    episode_path, start_frame = resolve_episode_path(args, dataset)
 
     goal_step = args.goal_step if args.goal_step is not None else args.plan_horizon
 
     clip, actions, states, extrinsics, indices, fstp = load_planning_example(
         dataset,
         episode_path=episode_path,
-        start_frame=args.start_frame,
+        start_frame=start_frame,
         plan_horizon=args.plan_horizon,
         goal_step=goal_step,
     )
@@ -401,7 +538,6 @@ def main():
     actions = torch.from_numpy(actions).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
     states = torch.from_numpy(states).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
     extrinsics = torch.from_numpy(extrinsics).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
-
     encoder, predictor, epoch = load_models(cfg, checkpoint_path, device)
     frames_per_clip = clip.size(2)
     normalize_reps = loss_cfg.get("normalize_reps", True)
@@ -443,11 +579,11 @@ def main():
             samples=args.samples,
             topk=args.topk,
             cem_steps=args.cem_steps,
-            max_xyz=args.max_xyz,
-            max_rot=args.max_rot,
-            max_gripper=args.max_gripper,
+            maxnorm=args.maxnorm,
             momentum_mean=args.momentum_mean,
             momentum_std=args.momentum_std,
+            momentum_mean_gripper=args.momentum_mean_gripper,
+            momentum_std_gripper=args.momentum_std_gripper,
             cem_verbose=args.cem_verbose,
         )
 
@@ -480,18 +616,61 @@ def main():
         )
         gt_goal_l1 = torch.mean(torch.abs(gt_reps[:, -tokens_per_frame:].flatten(1) - goal_rep.flatten(1)), dim=1)
 
+        energy_summary = None
+        if args.plot_energy_landscape:
+            energy_actions, energy_losses, energy_states, best_idx = compute_energy_landscape(
+                predictor=predictor,
+                context_rep=context_rep,
+                context_state=context_state,
+                context_extr=context_extr,
+                goal_rep=goal_rep,
+                tokens_per_frame=tokens_per_frame,
+                normalize_reps=normalize_reps,
+                rotation_mode=rotation_mode,
+                dtype=dtype,
+                mixed_precision=mixed_precision,
+                nsamples=args.energy_nsamples,
+                grid_size=args.energy_grid_size,
+            )
+            energy_output = args.energy_output
+            if energy_output is None:
+                energy_output = os.path.join(
+                    os.getcwd(),
+                    f"energy_{args.split}_episode{args.episode_index if args.episode_index is not None else 'path'}"
+                    f"_start{start_frame}_goal{goal_step}.png",
+                )
+            save_energy_landscape_plot(
+                actions=energy_actions,
+                losses=energy_losses,
+                gt_actions=gt_actions,
+                output_path=energy_output,
+                nsamples=args.energy_nsamples,
+            )
+            energy_summary = {
+                "output_path": energy_output,
+                "nsamples": int(args.energy_nsamples),
+                "grid_size": float(args.energy_grid_size),
+                "best_grid_action": tensor_to_list(energy_actions[best_idx]),
+                "best_grid_loss": float(energy_losses[best_idx].item()),
+                "gt_grid_action_loss": float(
+                    torch.mean(torch.abs(gt_reps[:, -tokens_per_frame:].flatten(1) - goal_rep.flatten(1)), dim=1).item()
+                ),
+            }
+
     result = {
         "checkpoint": checkpoint_path,
         "checkpoint_epoch": int(epoch),
         "episode_path": episode_path,
         "split": args.split,
-        "raw_start_frame": int(args.start_frame),
+        "raw_start_frame": int(start_frame),
         "raw_goal_frame": int(indices[goal_step]),
         "sampling_stride_frames": int(fstp),
         "clip_frame_indices": indices.tolist(),
         "plan_horizon": int(args.plan_horizon),
         "goal_step": int(goal_step),
         "rotation_mode": rotation_mode,
+        "cem_action_space": "raw_notebook",
+        "maxnorm": float(args.maxnorm),
         "planned_actions": tensor_to_list(planned_actions[0]),
         "ground_truth_actions": tensor_to_list(gt_actions[0]),
         "start_state": tensor_to_list(states[0, 0]),
@@ -500,6 +679,7 @@ def main():
         "predicted_final_state_from_gt_actions": tensor_to_list(gt_states[0, -1]),
         "pred_goal_l1": float(pred_goal_l1.item()),
         "gt_goal_l1": float(gt_goal_l1.item()),
+        "energy_landscape": energy_summary,
     }
 
     print(json.dumps(result, indent=2))
